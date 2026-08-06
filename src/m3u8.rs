@@ -56,10 +56,13 @@ pub fn rewrite_playlist(
     };
     let scheme_host = format!("{}://{}", base.scheme(), base.host_str().unwrap_or(""));
 
-    let sub_base = {
+    // sub_base: everything up to and including the last '/' in the URL
+    // e.g. "https://cdn.example.com/live/stream/playlist.m3u8" → "https://cdn.example.com/live/stream/"
+    let sub_base_owned: String = {
         let s = final_url;
-        &s[..s.rfind('/').map(|i| i + 1).unwrap_or(s.len())]
+        s[..s.rfind('/').map(|i| i + 1).unwrap_or(s.len())].to_string()
     };
+    let sub_base = sub_base_owned.as_str();
 
     let lines: Vec<String> = text
         .lines()
@@ -85,19 +88,11 @@ pub fn rewrite_playlist(
             }
 
             // Segment URL
-            // Skip logging/tracking URLs
+            // Skip logging/tracking/beacon URLs (return empty so playlist skips them)
             if trimmed.contains("log.")
                 || trimmed.contains("report")
                 || trimmed.contains("beacon")
                 || trimmed.contains("collect")
-            {
-                return line.to_string();
-            }
-
-            // Skip lines that don't look like paths/URLs
-            if !trimmed.contains('.')
-                && !trimmed.contains('/')
-                && !trimmed.contains('?')
             {
                 return line.to_string();
             }

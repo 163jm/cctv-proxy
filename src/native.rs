@@ -53,10 +53,12 @@ impl TsDecryptor {
             let out = std::slice::from_raw_parts(ptr, data.len()).to_vec();
             (self.free_decrypted)(ptr, data.len());
 
-            // Validate MPEG-TS sync bytes (0x47 every 188 bytes)
-            let valid = (0..data.len().min(1880))
-                .step_by(188)
-                .all(|i| out[i] == 0x47);
+            // Validate MPEG-TS sync bytes (0x47 every 188 bytes).
+            // Mirror original JS: check up to 10 packets; if invalid, return None
+            // so caller falls back to raw data.
+            let check_count = (data.len() / 188).min(10);
+            let valid = check_count == 0
+                || (0..check_count).all(|i| out[i * 188] == 0x47);
             if valid { Some(out) } else { None }
         }
     }
