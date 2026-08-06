@@ -89,7 +89,7 @@ pub async fn proxy_playlist(
             continue;
         }
 
-        let rewritten = m3u8::rewrite_playlist(&final_text, &final_url, &host, &channel_id);
+        let rewritten = m3u8::rewrite_playlist(&final_text, &final_url, &host, &channel_id, "ts");
 
         return (
             StatusCode::OK,

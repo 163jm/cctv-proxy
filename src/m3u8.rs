@@ -13,12 +13,7 @@ pub fn select_highest_bandwidth(text: &str, base_url: &str) -> Option<String> {
         let t = line.trim();
         if t.starts_with("#EXT-X-STREAM-INF") {
             if let Some(bw_str) = t.split("BANDWIDTH=").nth(1) {
-                cur_bw = bw_str
-                    .split(',')
-                    .next()
-                    .unwrap_or("0")
-                    .parse()
-                    .unwrap_or(0);
+                cur_bw = bw_str.split(',').next().unwrap_or("0").parse().unwrap_or(0);
             }
         } else if !t.is_empty() && !t.starts_with('#') && cur_bw > 0 {
             if cur_bw > best_bw {
@@ -35,20 +30,21 @@ fn resolve_url(href: &str, base: &Url) -> String {
     if href.starts_with("http") {
         href.to_string()
     } else {
-        base.join(href)
-            .map(|u| u.to_string())
-            .unwrap_or_else(|_| href.to_string())
+        base.join(href).map(|u| u.to_string()).unwrap_or_else(|_| href.to_string())
     }
 }
 
 /// Rewrite a media playlist so all segment URLs are routed through our proxy.
-/// `proxy_host` is e.g. `"127.0.0.1:3000"`.
-/// `channel_id` is used in the path prefix.
+///
+/// `seg_action`: the URL segment between channel_id and encoded URL.
+///   - CCTV uses "ts"       → `/{id}/ts/{encoded}`      (gateway → cctv::proxy_ts, adds CCTV Referer)
+///   - Provincial uses "segment" → `/{id}/segment/{enc}` (gateway → provincial::proxy_segment)
 pub fn rewrite_playlist(
     text: &str,
     final_url: &str,
     proxy_host: &str,
     channel_id: &str,
+    seg_action: &str,
 ) -> String {
     let base = match Url::parse(final_url) {
         Ok(u) => u,
@@ -56,13 +52,11 @@ pub fn rewrite_playlist(
     };
     let scheme_host = format!("{}://{}", base.scheme(), base.host_str().unwrap_or(""));
 
-    // sub_base: everything up to and including the last '/' in the URL
-    // e.g. "https://cdn.example.com/live/stream/playlist.m3u8" → "https://cdn.example.com/live/stream/"
-    let sub_base_owned: String = {
+    // sub_base: directory of the playlist URL
+    let sub_base: String = {
         let s = final_url;
         s[..s.rfind('/').map(|i| i + 1).unwrap_or(s.len())].to_string()
     };
-    let sub_base = sub_base_owned.as_str();
 
     let lines: Vec<String> = text
         .lines()
@@ -72,23 +66,22 @@ pub fn rewrite_playlist(
                 return line.to_string();
             }
 
-            // Rewrite #EXT-X-KEY URI
+            // Rewrite #EXT-X-KEY URI → always use /key/ route
             if trimmed.starts_with("#EXT-X-KEY") && trimmed.contains("URI=") {
                 return rewrite_attr_uri(trimmed, "key", &base, proxy_host, channel_id);
             }
 
-            // Rewrite #EXT-X-MAP URI
+            // Rewrite #EXT-X-MAP URI → use seg_action route
             if trimmed.starts_with("#EXT-X-MAP") && trimmed.contains("URI=") {
-                return rewrite_attr_uri(trimmed, "segment", &base, proxy_host, channel_id);
+                return rewrite_attr_uri(trimmed, seg_action, &base, proxy_host, channel_id);
             }
 
-            // Skip other directives
+            // Pass through all other directives unchanged
             if trimmed.starts_with('#') {
                 return line.to_string();
             }
 
-            // Segment URL
-            // Skip logging/tracking/beacon URLs (return empty so playlist skips them)
+            // Skip tracking/logging URLs
             if trimmed.contains("log.")
                 || trimmed.contains("report")
                 || trimmed.contains("beacon")
@@ -97,6 +90,13 @@ pub fn rewrite_playlist(
                 return line.to_string();
             }
 
+            // Match original JS: bare names with no '.', '/' or '?' pass through
+            // (e.g. pure-number CCTV segments resolved by the player from base URL).
+            if !trimmed.contains('.') && !trimmed.contains('/') && !trimmed.contains('?') {
+                return line.to_string();
+            }
+
+            // Resolve to absolute URL
             let abs_url = if trimmed.starts_with("http") {
                 trimmed.to_string()
             } else if trimmed.starts_with('/') {
@@ -106,7 +106,7 @@ pub fn rewrite_playlist(
             };
 
             let encoded = URL_SAFE_NO_PAD.encode(abs_url.as_bytes());
-            format!("http://{}/{}/segment/{}", proxy_host, channel_id, encoded)
+            format!("http://{}/{}/{}/{}", proxy_host, channel_id, seg_action, encoded)
         })
         .collect();
 
@@ -120,7 +120,6 @@ fn rewrite_attr_uri(
     proxy_host: &str,
     channel_id: &str,
 ) -> String {
-    // Find URI="..." and replace its value
     if let Some(start) = line.find("URI=\"") {
         let after = &line[start + 5..];
         if let Some(end) = after.find('"') {
@@ -131,19 +130,18 @@ fn rewrite_attr_uri(
                 .unwrap_or_else(|_| original_uri.to_string());
             let encoded = URL_SAFE_NO_PAD.encode(abs.as_bytes());
             let new_uri = format!("http://{}/{}/{}/{}", proxy_host, channel_id, action, encoded);
-            return line.replace(&format!("URI=\"{}\"", original_uri), &format!("URI=\"{}\"", new_uri));
+            return line.replace(
+                &format!("URI=\"{}\"", original_uri),
+                &format!("URI=\"{}\"", new_uri),
+            );
         }
     }
     line.to_string()
 }
 
-/// Fix CCTV m3u8 URLs to prefer 720P playlist format
+/// Fix CCTV m3u8 URLs to prefer 720P playlist format.
 pub fn fix_cctv_url(url: &str) -> String {
-    if url.contains("/index.m3u8")
-        && !url.contains("b=200-2100")
-        && !url.contains("BR=")
-    {
-        // Replace /index.m3u8... with _720P/playlist.m3u8?wsApp=HLS
+    if url.contains("/index.m3u8") && !url.contains("b=200-2100") && !url.contains("BR=") {
         if let Some(pos) = url.find("/index.m3u8") {
             return format!("{}_720P/playlist.m3u8?wsApp=HLS", &url[..pos]);
         }
@@ -151,7 +149,7 @@ pub fn fix_cctv_url(url: &str) -> String {
     url.to_string()
 }
 
-/// Check if an HTTP response looks like an auth error
+/// Check if an HTTP response looks like an auth error.
 pub fn is_auth_error(status: u16, body: &str) -> bool {
     if status == 403 || status == 401 {
         return true;
@@ -162,7 +160,7 @@ pub fn is_auth_error(status: u16, body: &str) -> bool {
         .any(|kw| lower.contains(kw))
 }
 
-/// Generate an M3U playlist entry for a channel
+/// Generate an M3U playlist entry for a channel.
 pub fn m3u_entry(channel_id: &str, name: &str, group: &str, proxy_host: &str) -> String {
     format!(
         "#EXTINF:-1 tvg-id=\"{id}\" tvg-name=\"{name}\" group-title=\"{group}\",{name}\nhttp://{host}/{id}/playlist.m3u8\n",
@@ -178,15 +176,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rewrite_relative_segments() {
-        let playlist = "#EXTM3U\n#EXTINF:6.0,\nseg001.ts\nseg002.ts";
+    fn test_rewrite_cctv_uses_ts_path() {
+        let playlist = "#EXTM3U\n#EXTINF:6.0,\nhttps://cdn.example.com/live/seg001.ts";
         let result = rewrite_playlist(
             playlist,
-            "https://example.com/live/stream/playlist.m3u8",
+            "https://cdn.example.com/live/playlist.m3u8",
             "localhost:3000",
             "cctv1",
+            "ts",
         );
-        assert!(result.contains("http://localhost:3000/cctv1/segment/"));
+        assert!(result.contains("/cctv1/ts/"), "CCTV should use /ts/ path");
+    }
+
+    #[test]
+    fn test_rewrite_provincial_uses_segment_path() {
+        let playlist = "#EXTM3U\n#EXTINF:6.0,\nhttps://cdn.example.com/live/seg001.ts";
+        let result = rewrite_playlist(
+            playlist,
+            "https://cdn.example.com/live/playlist.m3u8",
+            "localhost:3000",
+            "gd_1",
+            "segment",
+        );
+        assert!(result.contains("/gd_1/segment/"), "Provincial should use /segment/ path");
     }
 
     #[test]
@@ -200,12 +212,11 @@ mod tests {
 
     #[test]
     fn test_fix_cctv_url() {
-        let url = "https://ldncctvwbcdcnc.v.wscdns.com/ldncctvwbcd/cdrmldcctv1_1/index.m3u8?BR=td";
-        // URL contains BR= so should not be rewritten
-        assert_eq!(fix_cctv_url(url), url);
-
-        let url2 = "https://example.com/channel/index.m3u8";
-        let fixed = fix_cctv_url(url2);
+        let url = "https://example.com/channel/index.m3u8";
+        let fixed = fix_cctv_url(url);
         assert!(fixed.contains("_720P/playlist.m3u8"));
+
+        let url2 = "https://example.com/channel/index.m3u8?BR=td";
+        assert_eq!(fix_cctv_url(url2), url2); // has BR=, don't rewrite
     }
 }

@@ -345,7 +345,7 @@ async fn fetch_and_rewrite_m3u8(
         return Err(anyhow::anyhow!("HTTP {}", status));
     }
 
-    let result = m3u8::rewrite_playlist(&text, stream_url, proxy_host, channel_id);
+    let result = m3u8::rewrite_playlist(&text, stream_url, proxy_host, channel_id, "segment");
     state.m3u8_cache.set(cache_key, result.clone());
     Ok(result)
 }
