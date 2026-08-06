@@ -130,7 +130,11 @@ unsafe impl Sync for JstvSigner {}
 // ─── Combined native services ────────────────────────────────────────────────
 
 pub struct NativeLibs {
+    /// delib.so: handles a private container format (\x00\x00\x01 header),
+    /// NOT standard MPEG-TS. CDN segments are already plain TS (0x47 sync byte).
+    /// Kept here for completeness but not called in the proxy path.
     pub decryptor: Option<TsDecryptor>,
+    /// media_utils.so: ECDSA/RSA signing for JSTV channels (js_, zj_, sd_, sh_)
     pub signer: Option<JstvSigner>,
 }
 
@@ -138,8 +142,9 @@ impl NativeLibs {
     pub fn load(chrome_dir: impl AsRef<Path>, jstv_auth_enabled: bool) -> Self {
         let dir = chrome_dir.as_ref();
 
+        // Try to load decryptor but it's not used for standard TS passthrough
         let decryptor = TsDecryptor::load(dir.join("delib.so"))
-            .map_err(|e| warn!("delib.so not loaded: {}", e))
+            .map_err(|e| warn!("delib.so not loaded (not needed for CDN TS): {}", e))
             .ok();
 
         let signer = if jstv_auth_enabled {

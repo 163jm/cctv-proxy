@@ -124,16 +124,10 @@ pub async fn proxy_ts(
         None => return (StatusCode::BAD_GATEWAY, "TS upstream error").into_response(),
     };
 
-    // Attempt native decryption via delib.so
-    let payload = if data.len() >= 188 {
-        if let Some(ref dec) = state.native.decryptor {
-            dec.decrypt(&data).map(Bytes::from).unwrap_or(data)
-        } else {
-            data
-        }
-    } else {
-        data
-    };
+    // delib.so expects a private container format (starts with \x00\x00\x01),
+    // NOT standard MPEG-TS. CDN segments are already plain TS (sync byte 0x47).
+    // Decryption is a no-op for standard TS; pass through raw data directly.
+    let payload = data;
 
     Response::builder()
         .status(StatusCode::OK)
