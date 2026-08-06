@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.artifact }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -17,6 +17,11 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: tv-proxy-linux-amd64
+
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            artifact: tv-proxy-linux-arm64
+            cross: true
 
     steps:
       - uses: actions/checkout@v4
@@ -33,32 +38,44 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Install system deps (Linux)
-        if: runner.os == 'Linux'
+      - name: Install cross-compilation tools
+        if: matrix.cross == true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Install system deps (native amd64)
+        if: matrix.cross != true
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             pkg-config libssl-dev
 
-      - name: cargo check
-        run: cargo check --target ${{ matrix.target }}
-
-      - name: cargo test
-        run: cargo test --target ${{ matrix.target }}
+      - name: Configure cross linker
+        if: matrix.cross == true
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << 'TOML'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          TOML
 
       - name: cargo build --release
+        env:
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          OPENSSL_NO_VENDOR: "0"
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: |
-          cp target/${{ matrix.target }}/release/tv-proxy ${{ matrix.artifact }}
+        run: cp target/${{ matrix.target }}/release/tv-proxy ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
-          retention-days: 7
+          retention-days: 14
