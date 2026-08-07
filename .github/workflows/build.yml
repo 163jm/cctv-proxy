@@ -33,7 +33,7 @@ jobs:
         uses: taiki-e/install-action@cross
 
       - name: cargo build --release (musl static)
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }} --features jemalloc
 
       - name: Verify static binary
         run: file target/${{ matrix.target }}/release/tv-proxy
