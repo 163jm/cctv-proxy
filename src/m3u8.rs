@@ -153,12 +153,20 @@ pub fn fix_cctv_url(url: &str) -> String {
 }
 
 /// Check if an HTTP response looks like an auth error.
+/// Mirrors original JS: status 403/401 is always an auth error.
+/// For other status codes, only check body for known auth error strings.
+/// IMPORTANT: HTTP 200 with a valid M3U8 body is NEVER an auth error,
+/// even if the body contains words like "signature" in a URL.
 pub fn is_auth_error(status: u16, body: &str) -> bool {
     if status == 403 || status == 401 {
         return true;
     }
+    // Only check body for non-2xx responses
+    if status >= 200 && status < 300 {
+        return false;
+    }
     let lower = body.to_lowercase();
-    ["txsecret", "txtime", "auth_key", "auth failed", "auth expired", "signature", "unauthorized"]
+    ["txsecret", "txtime", "auth_key", "auth failed", "auth expired", "unauthorized"]
         .iter()
         .any(|kw| lower.contains(kw))
 }
