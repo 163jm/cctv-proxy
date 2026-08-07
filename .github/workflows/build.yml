@@ -33,12 +33,11 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-gnu-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-gnu-cargo-
 
-      - name: Install Zig
-        uses: taiki-e/install-action@zig
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@cargo-zigbuild
-
+      - name: Install Zig + cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: zig,cargo-zigbuild
+          
       - name: cargo zigbuild --release (glibc >= 2.28, dynamic)
         run: cargo zigbuild --release --target ${{ matrix.target }} --features jemalloc
 
