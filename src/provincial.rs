@@ -222,15 +222,38 @@ pub async fn ensure_stream_url(
         state.stream_cache.invalidate(channel_id, &channel.url);
     }
 
-    // 4. Browser fetch (serialised by semaphore)
+    // 4. Browser fetch (serialised by semaphore — only 1 at a time globally)
     let _permit = state.browser_sem.acquire().await.ok()?;
+
+    // Triple-check after acquiring semaphore (another task may have finished)
     {
         let ch_state = state.get_or_create_channel_state(channel_id);
-        let mut s = ch_state.lock().await;
-        // Double-check after acquiring semaphore
+        let s = ch_state.lock().await;
         if let Some(ref url) = s.stream_url {
             return Some(url.clone());
         }
+        if s.fetching {
+            // Still fetching even with semaphore held — wait it out
+            drop(s);
+            sleep_ms(500).await;
+            let s2 = ch_state.lock().await;
+            return s2.stream_url.clone();
+        }
+    }
+    // Also re-check stream cache after acquiring semaphore
+    if let Some(cached_url) = state.stream_cache.get(channel_id, &channel.url) {
+        if probe_url(state, channel_id, &cached_url).await {
+            let ch_state = state.get_or_create_channel_state(channel_id);
+            let mut s = ch_state.lock().await;
+            s.stream_url = Some(cached_url.clone());
+            return Some(cached_url);
+        }
+        state.stream_cache.invalidate(channel_id, &channel.url);
+    }
+
+    {
+        let ch_state = state.get_or_create_channel_state(channel_id);
+        let mut s = ch_state.lock().await;
         s.fetching = true;
     }
 
