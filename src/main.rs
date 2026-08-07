@@ -8,18 +8,14 @@ mod native;
 mod provincial;
 mod state;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::signal;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-#[cfg(feature = "jemalloc")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[derive(Parser, Debug)]
 #[command(name = "tv-proxy", about = "Chinese TV live-stream proxy (Rust rewrite)")]
@@ -47,13 +43,43 @@ struct Args {
 
 /// Locate the headless Chrome binary for the current platform.
 ///
-/// The original project bundles a Linux (often ARM64) `chrome/headless-shell`;
-/// on Windows that binary cannot run — this is the #1 reason browser-dependent
-/// provincial channels fail there. We look for platform-appropriate names first
-/// and warn loudly if only the Linux binary is present.
-fn resolve_chrome_path(app_dir: &std::path::Path) -> String {
-    let chrome_dir = app_dir.join("chrome");
+/// Search order:
+///   1. same directory as the tv-proxy executable (new default layout)
+///   2. `chrome/` inside APP_DIR (backward compatibility with the old layout)
+///
+/// On Windows, platform-appropriate names (headless-shell.exe / chrome.exe)
+/// are preferred; if only a Linux `headless-shell` is present we warn loudly —
+/// it cannot run on Windows and is the #1 reason browser-dependent provincial
+/// channels fail there.
+fn resolve_chrome_path(exe_dir: Option<&std::path::Path>, app_dir: &std::path::Path) -> String {
+    // 1) Same directory as the tv-proxy binary
+    if let Some(dir) = exe_dir {
+        #[cfg(target_os = "windows")]
+        {
+            for candidate in [dir.join("headless-shell.exe"), dir.join("chrome.exe")] {
+                if candidate.exists() {
+                    return candidate.to_string_lossy().into_owned();
+                }
+            }
+            // Linux binary copied next to the exe → warn, return anyway so the
+            // spawn error surfaces in the logs.
+            let linux_bin = dir.join("headless-shell");
+            if linux_bin.exists() {
+                native::warn_if_elf_on_windows(&linux_bin, "Headless browser");
+                return linux_bin.to_string_lossy().into_owned();
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let candidate = dir.join("headless-shell");
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
 
+    // 2) chrome/ dir inside APP_DIR (backward compatibility)
+    let chrome_dir = app_dir.join("chrome");
     #[cfg(target_os = "windows")]
     {
         for candidate in [
@@ -66,8 +92,6 @@ fn resolve_chrome_path(app_dir: &std::path::Path) -> String {
                 return candidate.to_string_lossy().into_owned();
             }
         }
-        // Only the Linux binary present → warn, then return it anyway so the
-        // spawn error surfaces in the logs instead of silently doing nothing.
         let linux_bin = chrome_dir.join("headless-shell");
         if linux_bin.exists() {
             native::warn_if_elf_on_windows(&linux_bin, "Headless browser");
@@ -99,9 +123,27 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let db_path = args.app_dir.join("app.db");
+    // Executable's own directory. Everything (app.db + delib + media_utils +
+    // headless-shell) can live next to the binary; APP_DIR is only a fallback
+    // for the old layout / explicit overrides.
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+    // app.db: prefer the binary's directory, fall back to APP_DIR (default ".").
+    let db_path = exe_dir
+        .as_ref()
+        .map(|d| d.join("app.db"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| args.app_dir.join("app.db"));
     info!("Loading database from {:?}", db_path);
-    let db = db::AppDb::load(&db_path)?;
+    let db = db::AppDb::load(&db_path)
+        .with_context(|| {
+            format!(
+                "Failed to open app.db at {:?} (looked next to the binary first, then in APP_DIR)",
+                db_path
+            )
+        })?;
     info!(
         "Loaded {} CCTV channels, {} provincial channels, {} site rules",
         db.cctv_channels.len(),
@@ -111,11 +153,17 @@ async fn main() -> Result<()> {
 
     let jstv_auth_enabled = db.jstv_auth_enabled;
 
-    let chrome_path = args.chrome_path.unwrap_or_else(|| resolve_chrome_path(&args.app_dir));
-    info!("Chrome path: {}", chrome_path);
-
+    // Native libs: delib / media_utils / headless-shell also prefer the binary's
+    // directory; `chrome/` inside APP_DIR is kept as a fallback for old layouts.
     let chrome_dir = args.app_dir.join("chrome");
-    let native = native::NativeLibs::load(&chrome_dir, jstv_auth_enabled);
+
+    let mut lib_dirs: Vec<&Path> = Vec::new();
+    if let Some(d) = &exe_dir {
+        lib_dirs.push(d.as_path());
+    }
+    lib_dirs.push(chrome_dir.as_path());
+
+    let native = native::NativeLibs::load(&lib_dirs, jstv_auth_enabled);
     if native.decryptor.is_some() {
         info!("TS decryptor (delib) loaded");
     } else {
@@ -126,6 +174,11 @@ async fn main() -> Result<()> {
     } else if jstv_auth_enabled {
         warn!("JSTV auth enabled but media_utils not loaded");
     }
+
+    let chrome_path = args
+        .chrome_path
+        .unwrap_or_else(|| resolve_chrome_path(exe_dir.as_deref(), &args.app_dir));
+    info!("Chrome path: {}", chrome_path);
 
     // Startup diagnostics: make it obvious why whole groups of channels fail.
     let signed_count = db

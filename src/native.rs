@@ -184,24 +184,28 @@ pub struct NativeLibs {
 }
 
 impl NativeLibs {
-    pub fn load(chrome_dir: impl AsRef<Path>, jstv_auth_enabled: bool) -> Self {
-        let dir = chrome_dir.as_ref();
-
-        // Try to load decryptor but it's not used for standard TS passthrough
-        let decryptor = {
+    /// Load the native libraries, searching `dirs` in order.
+    ///
+    /// `dirs` should list the executable's own directory first (new default
+    /// layout: delib/media_utils sit next to the tv-proxy binary), followed by
+    /// `{app_dir}/chrome` for backward compatibility with the old layout.
+    pub fn load(dirs: &[&Path], jstv_auth_enabled: bool) -> Self {
+        let decryptor = dirs.iter().find_map(|dir| {
             let lib_path = dir.join(platform_lib_name("delib"));
             warn_if_elf_on_windows(&lib_path, "TS decryptor");
             TsDecryptor::load(&lib_path)
                 .map_err(|e| warn!("delib not loaded ({}): {}", lib_path.display(), e))
                 .ok()
-        };
+        });
 
         let signer = if jstv_auth_enabled {
-            let lib_path = dir.join(platform_lib_name("media_utils"));
-            warn_if_elf_on_windows(&lib_path, "JSTV signer");
-            JstvSigner::load(&lib_path)
-                .map_err(|e| warn!("media_utils not loaded ({}): {}", lib_path.display(), e))
-                .ok()
+            dirs.iter().find_map(|dir| {
+                let lib_path = dir.join(platform_lib_name("media_utils"));
+                warn_if_elf_on_windows(&lib_path, "JSTV signer");
+                JstvSigner::load(&lib_path)
+                    .map_err(|e| warn!("media_utils not loaded ({}): {}", lib_path.display(), e))
+                    .ok()
+            })
         } else {
             None
         };
