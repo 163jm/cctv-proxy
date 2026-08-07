@@ -124,10 +124,22 @@ pub async fn proxy_ts(
         None => return (StatusCode::BAD_GATEWAY, "TS upstream error").into_response(),
     };
 
-    // delib.so expects a private container format (starts with \x00\x00\x01),
-    // NOT standard MPEG-TS. CDN segments are already plain TS (sync byte 0x47).
-    // Decryption is a no-op for standard TS; pass through raw data directly.
-    let payload = data;
+    // Mirror original JS decryptTs logic:
+    // Call decrypt_ts on the buffer; if result has valid MPEG-TS sync bytes (0x47
+    // every 188 bytes across first 10 packets), use decrypted data, otherwise
+    // fall back to raw data. This handles CCTV's proprietary scrambling.
+    let payload = if data.len() >= 188 {
+        if let Some(ref dec) = state.native.decryptor {
+            match dec.decrypt(&data) {
+                Some(decrypted) => Bytes::from(decrypted),
+                None => data,  // sync check failed → use raw
+            }
+        } else {
+            data
+        }
+    } else {
+        data
+    };
 
     Response::builder()
         .status(StatusCode::OK)

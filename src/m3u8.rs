@@ -66,18 +66,21 @@ pub fn rewrite_playlist(
                 return line.to_string();
             }
 
-            // Rewrite #EXT-X-KEY URI → always use /key/ route
-            if trimmed.starts_with("#EXT-X-KEY") && trimmed.contains("URI=") {
-                return rewrite_attr_uri(trimmed, "key", &base, proxy_host, channel_id);
-            }
-
-            // Rewrite #EXT-X-MAP URI → use seg_action route
-            if trimmed.starts_with("#EXT-X-MAP") && trimmed.contains("URI=") {
-                return rewrite_attr_uri(trimmed, seg_action, &base, proxy_host, channel_id);
-            }
-
-            // Pass through all other directives unchanged
+            // CCTV: all directive lines (including #EXT-X-KEY) pass through unchanged.
+            // The decryption is handled natively by delib.so, not via HLS AES-128.
+            // Provincial uses seg_action="segment" and rewrites KEY separately.
             if trimmed.starts_with('#') {
+                if seg_action == "ts" {
+                    // CCTV: pass all directives through unchanged (mirrors original JS)
+                    return line.to_string();
+                }
+                // Provincial: rewrite KEY and MAP URIs
+                if trimmed.starts_with("#EXT-X-KEY") && trimmed.contains("URI=") {
+                    return rewrite_attr_uri(trimmed, "key", &base, proxy_host, channel_id);
+                }
+                if trimmed.starts_with("#EXT-X-MAP") && trimmed.contains("URI=") {
+                    return rewrite_attr_uri(trimmed, seg_action, &base, proxy_host, channel_id);
+                }
                 return line.to_string();
             }
 
