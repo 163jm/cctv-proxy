@@ -5,74 +5,46 @@ on:
 
 jobs:
   build:
-    name: Build (${{ matrix.artifact }})
-    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.artifact }}, musl)
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             artifact: tv-proxy-linux-amd64
-
-          - os: ubuntu-22.04
-            target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             artifact: tv-proxy-linux-arm64
-            cross: true
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
-      - name: Cache cargo
+      - name: Cache cargo target
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
+          path: target
+          key: ${{ runner.os }}-${{ matrix.target }}-musl-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-musl-cargo-
 
-      - name: Install cross-compilation tools
-        if: matrix.cross == true
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Install cross
+        uses: taiki-e/install-action@cross
 
-      - name: Install system deps (native amd64)
-        if: matrix.cross != true
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev
+      - name: cargo build --release (musl static)
+        run: cross build --release --target ${{ matrix.target }}
 
-      - name: Configure cross linker
-        if: matrix.cross == true
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml << 'TOML'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          TOML
-
-      - name: cargo build --release
-        env:
-          PKG_CONFIG_ALLOW_CROSS: "1"
-          OPENSSL_NO_VENDOR: "0"
-        run: cargo build --release --target ${{ matrix.target }} --features jemalloc
+      - name: Verify static binary
+        run: file target/${{ matrix.target }}/release/tv-proxy
 
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/tv-proxy ${{ matrix.artifact }}
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
-          retention-days: 14
+          tag_name: test
+          name: test
+          draft: false
+          files: ${{ matrix.artifact }}
