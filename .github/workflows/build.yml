@@ -40,7 +40,6 @@ jobs:
           curl -fsSL "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-linux-${ZIG_VER}.tar.xz" -o zig.tar.xz
           tar -xJf zig.tar.xz
           echo "$PWD/zig-x86_64-linux-${ZIG_VER}" >> "$GITHUB_PATH"
-          zig version
           
       - name: cargo zigbuild --release (glibc >= 2.28, dynamic)
         run: cargo zigbuild --release --target ${{ matrix.target }} --features jemalloc
