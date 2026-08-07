@@ -1,6 +1,6 @@
 /// Provincial TV proxy handlers.
 use crate::{
-    browser::BrowserPool,
+    browser::{BrowserPool, MgtvOpts},
     db::Channel,
     m3u8::{self, is_auth_error},
     state::AppState,
@@ -167,7 +167,9 @@ pub async fn admin_cache(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /admin/poller/refresh
-pub async fn admin_refresh() -> impl IntoResponse {
+pub async fn admin_refresh(State(state): State<AppState>) -> impl IntoResponse {
+    // Wake the background poller immediately (previously this was a no-op stub).
+    state.refresh.notify_one();
     (StatusCode::OK, "Polling triggered")
 }
 
@@ -287,31 +289,116 @@ async fn do_browser_fetch(
 ) -> Option<String> {
     let rule = state.site_rule_for(channel_id);
 
-    // MGTV uses sid + special action_script
-    let is_mgtv = channel_id.starts_with("mg_");
-    if is_mgtv {
-        let page_url = rule
-            .and_then(|r| r.target_url.as_deref())
-            .unwrap_or("https://www.mgtv.com/live?lastp=ch_home&_source_=B");
+    // DOM filter: site-specific rule overrides the global one (mirrors original
+    // setupPageFilters: rule?.dom_filter || GLOBAL_DOM_FILTER).
+    let dom_filter: String = rule
+        .and_then(|r| r.dom_filter.clone())
+        .unwrap_or_else(|| state.global_dom_filter.to_string());
+    let blocked: Vec<String> = state.blocked_domains.iter().cloned().collect();
+
+    let page_url = rule
+        .and_then(|r| r.target_url.clone())
+        .unwrap_or_else(|| channel.url.clone());
+    let m3u8_match = rule
+        .and_then(|r| r.m3u8_match.clone())
+        .unwrap_or_else(|| ".m3u8".to_string());
+
+    // MGTV: navigate live page, close modals, click channel by sid. Selectors
+    // come from site_rules.selectors (JSON), falling back to original defaults.
+    if channel_id.starts_with("mg_") {
         let sid = channel.sid.as_deref()?;
-        info!("[{}] MGTV browser fetch sid={}", channel_id, sid);
+        let (close_selectors, item_template) = mgtv_selectors(rule);
+        let opts = MgtvOpts {
+            sid,
+            close_selectors: &close_selectors,
+            item_template: &item_template,
+        };
+        info!("[{}] MGTV browser fetch sid={} (selectors from DB)", channel_id, sid);
         return browser
-            .fetch(page_url, ".m3u8", &state.user_agent, state.fetch_timeout_ms, Some(sid))
+            .fetch(
+                &page_url,
+                ".m3u8",
+                &state.user_agent,
+                state.fetch_timeout_ms,
+                &dom_filter,
+                &blocked,
+                Some(opts),
+                false,
+            )
             .await;
     }
 
-    // All other channels: default fetch (navigate + intercept .m3u8 request)
-    let page_url = rule
-        .and_then(|r| r.target_url.as_deref())
-        .unwrap_or(&channel.url);
-    let m3u8_match = rule
-        .and_then(|r| r.m3u8_match.as_deref())
-        .unwrap_or(".m3u8");
+    // GDTV (广东台): dedicated channel-detail-page fetch (mirrors gd_ action_script).
+    if channel_id.starts_with("gd_") {
+        info!("[{}] GDTV browser fetch: {}", channel_id, page_url);
+        return browser
+            .fetch(
+                &page_url,
+                &m3u8_match,
+                &state.user_agent,
+                state.fetch_timeout_ms,
+                &dom_filter,
+                &blocked,
+                None,
+                true,
+            )
+            .await;
+    }
 
+    // All other channels (hb_ 河北 etc.): default fetch (navigate + intercept .m3u8)
     info!("[{}] Default browser fetch: {}", channel_id, page_url);
     browser
-        .fetch(page_url, m3u8_match, &state.user_agent, state.fetch_timeout_ms, None)
+        .fetch(
+            &page_url,
+            &m3u8_match,
+            &state.user_agent,
+            state.fetch_timeout_ms,
+            &dom_filter,
+            &blocked,
+            None,
+            false,
+        )
         .await
+}
+
+/// Parse site_rules.selectors (JSON) for MGTV: `close_modal` selector list and
+/// `channel_item` template. Falls back to the original defaults if unset/invalid.
+fn mgtv_selectors(rule: Option<&crate::db::SiteRule>) -> (Vec<String>, String) {
+    let default_close = [
+        ".m-close", ".modal-close", ".ext-close", ".close-btn", ".dialog-close",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect::<Vec<_>>();
+    let default_item = "a[data-channel-sid=\"{sid}\"]".to_string();
+
+    let Some(selectors) = rule.and_then(|r| r.selectors.as_deref()) else {
+        return (default_close, default_item);
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(selectors) else {
+        return (default_close, default_item);
+    };
+
+    let close = val
+        .get("close_modal")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default_close.clone());
+
+    let item = val
+        .get("channel_item")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or(default_item);
+
+    (close, item)
 }
 
 fn invalidate_channel(state: &AppState, channel_id: &str, url: &str) {
@@ -329,8 +416,19 @@ async fn probe_url(state: &AppState, channel_id: &str, url: &str) -> bool {
     for (k, v) in &extra {
         req = req.header(k.as_str(), v.as_str());
     }
-    match timeout(Duration::from_secs(5), req.send()).await {
-        Ok(Ok(r)) => r.status().is_success(),
+    match timeout(Duration::from_secs(8), req.send()).await {
+        Ok(Ok(r)) if r.status().is_success() => {
+            // Mirror the original JS: a cached stream URL is only valid if the
+            // body actually looks like an M3U8 playlist (a 2xx HTML error/auth
+            // page must not be accepted).
+            match timeout(Duration::from_secs(8), r.text()).await {
+                Ok(Ok(text)) => {
+                    let t = text.trim_start();
+                    t.starts_with("#EXTM3U") || t.starts_with("#EXT-X-")
+                }
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
@@ -421,8 +519,13 @@ pub async fn run_poller(state: AppState, browser: Arc<BrowserPool>) {
         }
 
         state.stream_cache.cleanup_expired();
-        info!("[Poller] Done, sleeping {}ms", state.poll_interval_ms);
-        tokio::time::sleep(Duration::from_millis(state.poll_interval_ms)).await;
+        info!("[Poller] Done; waiting {}ms or manual refresh", state.poll_interval_ms);
+        tokio::select! {
+            _ = state.refresh.notified() => {
+                info!("[Poller] Manual refresh triggered via /admin/poller/refresh");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(state.poll_interval_ms)) => {}
+        }
     }
 }
 

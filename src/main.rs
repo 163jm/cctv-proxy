@@ -41,6 +41,48 @@ struct Args {
     log_level: String,
 }
 
+/// Locate the headless Chrome binary for the current platform.
+///
+/// The original project bundles a Linux (often ARM64) `chrome/headless-shell`;
+/// on Windows that binary cannot run — this is the #1 reason browser-dependent
+/// provincial channels fail there. We look for platform-appropriate names first
+/// and warn loudly if only the Linux binary is present.
+fn resolve_chrome_path(app_dir: &std::path::Path) -> String {
+    let chrome_dir = app_dir.join("chrome");
+
+    #[cfg(target_os = "windows")]
+    {
+        for candidate in [
+            chrome_dir.join("headless-shell.exe"),
+            chrome_dir.join("chrome.exe"),
+            app_dir.join("headless-shell.exe"),
+            app_dir.join("chrome.exe"),
+        ] {
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        // Only the Linux binary present → warn, then return it anyway so the
+        // spawn error surfaces in the logs instead of silently doing nothing.
+        let linux_bin = chrome_dir.join("headless-shell");
+        if linux_bin.exists() {
+            native::warn_if_elf_on_windows(&linux_bin, "Headless browser");
+            return linux_bin.to_string_lossy().into_owned();
+        }
+        "headless-shell".to_string()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        for candidate in [chrome_dir.join("headless-shell"), app_dir.join("headless-shell")] {
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        "headless-shell".to_string()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -65,27 +107,55 @@ async fn main() -> Result<()> {
 
     let jstv_auth_enabled = db.jstv_auth_enabled;
 
-    let chrome_path = args.chrome_path.unwrap_or_else(|| {
-        let local = args.app_dir.join("chrome/headless-shell");
-        if local.exists() {
-            local.to_string_lossy().into_owned()
-        } else {
-            "headless-shell".to_string()
-        }
-    });
+    let chrome_path = args.chrome_path.unwrap_or_else(|| resolve_chrome_path(&args.app_dir));
     info!("Chrome path: {}", chrome_path);
 
     let chrome_dir = args.app_dir.join("chrome");
     let native = native::NativeLibs::load(&chrome_dir, jstv_auth_enabled);
     if native.decryptor.is_some() {
-        info!("TS decryptor (delib.so) loaded");
+        info!("TS decryptor (delib) loaded");
     } else {
         warn!("TS decryptor not available - CCTV segments will not be decrypted");
     }
     if native.signer.is_some() {
-        info!("JSTV signer (media_utils.so) loaded");
+        info!("JSTV signer (media_utils) loaded");
     } else if jstv_auth_enabled {
-        warn!("JSTV auth enabled but media_utils.so not loaded");
+        warn!("JSTV auth enabled but media_utils not loaded");
+    }
+
+    // Startup diagnostics: make it obvious why whole groups of channels fail.
+    let signed_count = db
+        .channels
+        .iter()
+        .filter(|c| {
+            c.id.starts_with("js_")
+                || c.id.starts_with("zj_")
+                || c.id.starts_with("sd_")
+                || c.id.starts_with("sh_")
+        })
+        .count();
+    if signed_count > 0 && native.signer.is_none() {
+        warn!(
+            "{} signed channel(s) (js_/zj_/sd_/sh_) need media_utils but it is NOT loaded — \
+             these channels will fail until the correct native library is provided.",
+            signed_count
+        );
+    }
+    let browser_channels = db
+        .channels
+        .iter()
+        .filter(|c| {
+            !(c.id.starts_with("js_")
+                || c.id.starts_with("zj_")
+                || c.id.starts_with("sd_")
+                || c.id.starts_with("sh_"))
+        })
+        .count();
+    if browser_channels > 0 {
+        info!(
+            "{} channel(s) rely on the headless browser for stream discovery.",
+            browser_channels
+        );
     }
 
     let state = state::AppState::new(db, native, chrome_path.clone(), args.app_dir.clone());

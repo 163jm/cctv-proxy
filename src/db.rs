@@ -43,6 +43,7 @@ pub struct AppDb {
     pub cctv_channels: Vec<CctvChannel>,
     pub channels: Vec<Channel>,
     pub site_rules: Vec<SiteRule>,
+    pub global_dom_filter: String,
     pub user_agent: String,
     pub blocked_domains: Vec<String>,
     pub poll_interval_ms: u64,
@@ -68,6 +69,18 @@ impl AppDb {
         let user_agent = get_config("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
         let blocked_domains: Vec<String> =
             serde_json::from_str(&get_config("blocked_domains", "[]")).unwrap_or_default();
+
+        // Global DOM filter (site_rules row with prefix='global'), applied to every
+        // browser page via Page.addScriptToEvaluateOnNewDocument — mirrors the
+        // original Node.js app (setupPageFilters: rule?.dom_filter || GLOBAL_DOM_FILTER).
+        let global_dom_filter: String = conn
+            .query_row(
+                "SELECT dom_filter FROM site_rules WHERE prefix = 'global'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_default();
+
         let poll_interval_ms: u64 = get_config("poll_interval_ms", "1500000").parse().unwrap_or(1_500_000);
         let decrypt_cache_ttl_ms: u64 = get_config("decrypt_cache_ttl_ms", "1800000").parse().unwrap_or(1_800_000);
         let fetch_timeout_ms: u64 = get_config("fetch_timeout_ms", "20000").parse().unwrap_or(20_000);
@@ -156,6 +169,7 @@ impl AppDb {
             cctv_channels,
             channels,
             site_rules,
+            global_dom_filter,
             user_agent,
             blocked_domains,
             poll_interval_ms,

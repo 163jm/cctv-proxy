@@ -6,7 +6,7 @@ use crate::{
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 #[derive(Default)]
 pub struct ChannelState {
@@ -23,6 +23,7 @@ pub struct AppState {
     pub cctv_channels: Arc<HashMap<String, CctvChannel>>,
     pub channels: Arc<HashMap<String, Channel>>,
     pub site_rules: Arc<Vec<SiteRule>>,
+    pub global_dom_filter: Arc<String>,
     pub user_agent: Arc<String>,
     pub blocked_domains: Arc<Vec<String>>,
     pub fetch_timeout_ms: u64,
@@ -35,6 +36,8 @@ pub struct AppState {
     pub m3u8_cache: Arc<M3u8Cache>,
     pub channel_states: Arc<DashMap<String, SharedChannelState>>,
     pub browser_sem: Arc<Semaphore>,
+    /// Signalled by POST /admin/poller/refresh to trigger an immediate poll pass.
+    pub refresh: Arc<Notify>,
     pub http: reqwest::Client,
     pub chrome_path: Arc<String>,
     pub app_dir: Arc<std::path::PathBuf>,
@@ -58,6 +61,7 @@ impl AppState {
             cctv_channels: Arc::new(cctv_map),
             channels: Arc::new(channel_map),
             site_rules: Arc::new(db.site_rules),
+            global_dom_filter: Arc::new(db.global_dom_filter),
             user_agent: Arc::new(db.user_agent),
             blocked_domains: Arc::new(db.blocked_domains),
             fetch_timeout_ms: db.fetch_timeout_ms,
@@ -69,8 +73,9 @@ impl AppState {
             segment_cache: Arc::new(SegmentCache::new(10_000, 80)),
             m3u8_cache: Arc::new(M3u8Cache::new(1_500, 200)),
             channel_states: Arc::new(DashMap::new()),
-            // Allow 2 concurrent browser fetches (one per tab, reuse process)
+            // Allow 1 concurrent browser fetch (one tab at a time, reuse process)
             browser_sem: Arc::new(Semaphore::new(1)),
+            refresh: Arc::new(Notify::new()),
             http,
             chrome_path: Arc::new(chrome_path),
             app_dir: Arc::new(app_dir),

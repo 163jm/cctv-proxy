@@ -1,10 +1,55 @@
-/// Native library bindings for delib.so (TS decryption) and media_utils.so (JSTV signing)
+/// Native library bindings for delib (TS decryption) and media_utils (JSTV signing)
 use anyhow::{anyhow, Result};
 use libloading::{Library, Symbol};
 use std::path::Path;
 use tracing::{info, warn};
 
-// ─── TS Decryptor (delib.so) ────────────────────────────────────────────────
+// ─── Platform helpers ────────────────────────────────────────────────────────
+
+/// Return the platform-appropriate shared-library file name.
+/// Windows: delib.dll / media_utils.dll
+/// macOS:   delib.dylib / media_utils.dylib
+/// Linux:   delib.so / media_utils.so
+pub(crate) fn platform_lib_name(base: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        format!("{}.dll", base)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        format!("{}.dylib", base)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        format!("{}.so", base)
+    }
+}
+
+/// Warn loudly when a file is a Linux ELF binary but we're running on Windows.
+/// The original project ships Linux (often ARM64) chrome/ + native libs; they
+/// cannot be executed or dlopen'd on Windows, which is the #1 reason every
+/// browser/signer-dependent channel fails there.
+pub(crate) fn warn_if_elf_on_windows(path: &std::path::Path, what: &str) {
+    if !cfg!(windows) {
+        return;
+    }
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return;
+    };
+    let mut magic = [0u8; 4];
+    if f.read_exact(&mut magic).is_ok() && magic == [0x7f, b'E', b'L', b'F'] {
+        warn!(
+            "{} \"{}\" is a Linux ELF binary — it cannot be used on Windows. \
+             Provide the Windows version (delib.dll / media_utils.dll / headless-shell.exe) \
+             for these channels to work.",
+            what,
+            path.display(),
+        );
+    }
+}
+
+// ─── TS Decryptor (delib) ────────────────────────────────────────────────────
 
 type DecryptTsFn = unsafe extern "C" fn(*const u8, usize) -> *mut u8;
 type FreeDecryptedFn = unsafe extern "C" fn(*mut u8, usize);
@@ -29,7 +74,7 @@ impl TsDecryptor {
             // Copy the function pointers out so we can move `lib`
             let decrypt_ts = *decrypt_ts;
             let free_decrypted = *free_decrypted;
-            info!("Loaded delib.so (TS decryptor)");
+            info!("Loaded delib (TS decryptor) from {}", path.display());
             Ok(Self {
                 _lib: lib,
                 decrypt_ts,
@@ -68,7 +113,7 @@ impl TsDecryptor {
 unsafe impl Send for TsDecryptor {}
 unsafe impl Sync for TsDecryptor {}
 
-// ─── JSTV URL Signer (media_utils.so) ───────────────────────────────────────
+// ─── JSTV URL Signer (media_utils) ──────────────────────────────────────────
 
 // The native function signature: const char* get_signed_url(const char* channel_id)
 type GetSignedUrlFn = unsafe extern "C" fn(*const std::ffi::c_char) -> *const std::ffi::c_char;
@@ -97,7 +142,7 @@ impl JstvSigner {
                 .ok()
                 .map(|s| *s);
 
-            info!("Loaded media_utils.so (JSTV signer)");
+            info!("Loaded media_utils (JSTV signer) from {}", path.display());
             Ok(Self {
                 _lib: lib,
                 get_signed_url,
@@ -130,11 +175,11 @@ unsafe impl Sync for JstvSigner {}
 // ─── Combined native services ────────────────────────────────────────────────
 
 pub struct NativeLibs {
-    /// delib.so: handles a private container format (\x00\x00\x01 header),
+    /// delib: handles a private container format (\x00\x00\x01 header),
     /// NOT standard MPEG-TS. CDN segments are already plain TS (0x47 sync byte).
     /// Kept here for completeness but not called in the proxy path.
     pub decryptor: Option<TsDecryptor>,
-    /// media_utils.so: ECDSA/RSA signing for JSTV channels (js_, zj_, sd_, sh_)
+    /// media_utils: ECDSA/RSA signing for JSTV channels (js_, zj_, sd_, sh_)
     pub signer: Option<JstvSigner>,
 }
 
@@ -143,13 +188,19 @@ impl NativeLibs {
         let dir = chrome_dir.as_ref();
 
         // Try to load decryptor but it's not used for standard TS passthrough
-        let decryptor = TsDecryptor::load(dir.join("delib.so"))
-            .map_err(|e| warn!("delib.so not loaded (not needed for CDN TS): {}", e))
-            .ok();
+        let decryptor = {
+            let lib_path = dir.join(platform_lib_name("delib"));
+            warn_if_elf_on_windows(&lib_path, "TS decryptor");
+            TsDecryptor::load(&lib_path)
+                .map_err(|e| warn!("delib not loaded ({}): {}", lib_path.display(), e))
+                .ok()
+        };
 
         let signer = if jstv_auth_enabled {
-            JstvSigner::load(dir.join("media_utils.so"))
-                .map_err(|e| warn!("media_utils.so not loaded: {}", e))
+            let lib_path = dir.join(platform_lib_name("media_utils"));
+            warn_if_elf_on_windows(&lib_path, "JSTV signer");
+            JstvSigner::load(&lib_path)
+                .map_err(|e| warn!("media_utils not loaded ({}): {}", lib_path.display(), e))
                 .ok()
         } else {
             None
