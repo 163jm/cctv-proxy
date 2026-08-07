@@ -33,10 +33,14 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-gnu-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-gnu-cargo-
 
-      - name: Install Zig + cargo-zigbuild
-        uses: taiki-e/install-action@v2
-        with:
-          tool: zig,cargo-zigbuild
+      - name: Install Zig (zigbuild backend)
+        run: |
+          set -e
+          ZIG_VER=0.14.1
+          curl -fsSL "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-linux-${ZIG_VER}.tar.xz" -o zig.tar.xz
+          tar -xJf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-${ZIG_VER}" >> "$GITHUB_PATH"
+          zig version
           
       - name: cargo zigbuild --release (glibc >= 2.28, dynamic)
         run: cargo zigbuild --release --target ${{ matrix.target }} --features jemalloc
