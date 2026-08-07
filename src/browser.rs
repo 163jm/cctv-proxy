@@ -328,6 +328,7 @@ async fn drive_mgtv(
 pub struct BrowserPool {
     handle: Mutex<Option<BrowserHandle>>,
     chrome_path: String,
+    last_fail: Mutex<Option<std::time::Instant>>,
 }
 
 impl BrowserPool {
@@ -335,20 +336,35 @@ impl BrowserPool {
         Arc::new(Self {
             handle: Mutex::new(None),
             chrome_path,
+            last_fail: Mutex::new(None),
         })
     }
 
     async fn ensure_browser(&self) -> bool {
+        // Backoff: don't retry within 30s of a spawn failure
+        {
+            let fail = self.last_fail.lock().await;
+            if let Some(t) = *fail {
+                if t.elapsed() < Duration::from_secs(30) {
+                    return false;
+                }
+            }
+        }
+
         let mut guard = self.handle.lock().await;
         if guard.is_none() {
             match BrowserHandle::spawn(&self.chrome_path).await {
                 Ok(h) => {
                     info!("Chrome started");
                     *guard = Some(h);
+                    let mut fail = self.last_fail.lock().await;
+                    *fail = None;
                     true
                 }
                 Err(e) => {
                     warn!("Failed to start Chrome: {}", e);
+                    let mut fail = self.last_fail.lock().await;
+                    *fail = Some(std::time::Instant::now());
                     false
                 }
             }
