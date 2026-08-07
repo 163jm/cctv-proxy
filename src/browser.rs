@@ -1,22 +1,15 @@
-/// Headless browser stream fetcher.
+/// Headless browser stream fetcher via Chrome DevTools Protocol.
 ///
-/// Uses Chrome DevTools Protocol via a subprocess + CDP JSON over HTTP/WebSocket.
-/// This replaces the Puppeteer usage in the original Node.js code.
-///
-/// Strategy:
-///   1. Spawn headless-shell with `--remote-debugging-port=0` (auto port).
-///   2. Read the actual port from stderr.
-///   3. Use the CDP `/json/new` endpoint to open a tab, navigate, intercept
-///      network events, and wait for a matching `.m3u8` request URL.
-///   4. Return the URL and close the tab (leaving the browser process alive
-///      for the next call via a shared handle).
-///
-/// This approach avoids external crate dependencies beyond `reqwest` and `tokio`.
+/// Replaces Puppeteer from the original Node.js code.
+/// Supports:
+///   - Default fetcher: navigate + intercept network requests for .m3u8
+///   - MGTV fetcher: navigate, close modal, click channel by sid, wait for .m3u8
+///   - GDTV fetcher: navigate to channel URL, intercept .m3u8
 
 use anyhow::{anyhow, Context, Result};
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::process::Stdio;
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -24,7 +17,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 #[derive(Debug, Deserialize)]
 struct CdpTarget {
@@ -33,8 +26,10 @@ struct CdpTarget {
     ws_url: Option<String>,
 }
 
+// ─── BrowserHandle ────────────────────────────────────────────────────────────
+
 pub struct BrowserHandle {
-    process: Child,
+    _process: Child,
     port: u16,
     http: reqwest::Client,
 }
@@ -50,109 +45,176 @@ impl BrowserHandle {
                 "--mute-audio",
                 "--autoplay-policy=no-user-gesture-required",
                 "--disable-blink-features=AutomationControlled",
-                "--remote-debugging-port=0", // OS picks a free port
+                "--remote-debugging-port=0",
                 "--remote-debugging-address=127.0.0.1",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .context("Failed to spawn headless-shell")?;
 
-        // Read stderr to find "DevTools listening on ws://127.0.0.1:{port}/..."
         let stderr = child.stderr.take().unwrap();
         let port = read_devtools_port(stderr).await?;
-        info!("Chrome DevTools listening on port {}", port);
+        info!("Chrome DevTools on port {}", port);
 
         Ok(Self {
-            process: child,
+            _process: child,
             port,
             http: reqwest::Client::new(),
         })
     }
 
-    /// Open a new tab, navigate to `url`, intercept network requests,
-    /// return the first URL matching `m3u8_match`, then close the tab.
-    pub async fn fetch_stream_url(
+    async fn new_tab(&self) -> Result<CdpTarget> {
+        let target: CdpTarget = self
+            .http
+            .put(format!("http://127.0.0.1:{}/json/new", self.port))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(target)
+    }
+
+    async fn close_tab(&self, id: &str) {
+        let _ = self
+            .http
+            .get(format!("http://127.0.0.1:{}/json/close/{}", self.port, id))
+            .send()
+            .await;
+    }
+
+    /// Generic: navigate to page_url and intercept first network request matching m3u8_match.
+    pub async fn fetch_default(
         &self,
         page_url: &str,
         m3u8_match: &str,
         user_agent: &str,
         fetch_timeout: Duration,
-    ) -> Result<Option<String>> {
-        // Create a new tab via CDP REST API
-        let new_tab: CdpTarget = self
-            .http
-            .put(format!("http://127.0.0.1:{}/json/new?{}", self.port, page_url))
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        let ws_url = new_tab
-            .ws_url
-            .ok_or_else(|| anyhow!("No WebSocket URL for new tab"))?;
+    ) -> Option<String> {
+        let tab = self.new_tab().await.ok()?;
+        let ws_url = tab.ws_url.clone()?;
 
         let result = timeout(
             fetch_timeout,
-            drive_tab(&ws_url, page_url, m3u8_match, user_agent),
+            drive_default(&ws_url, page_url, m3u8_match, user_agent),
         )
         .await;
 
-        // Close the tab regardless of outcome
-        let _ = self
-            .http
-            .get(format!(
-                "http://127.0.0.1:{}/json/close/{}",
-                self.port, new_tab.id
-            ))
-            .send()
-            .await;
+        self.close_tab(&tab.id).await;
 
         match result {
-            Ok(inner) => inner,
-            Err(_) => Ok(None), // timeout
+            Ok(Ok(u)) => u,
+            _ => None,
+        }
+    }
+
+    /// MGTV: navigate, close modal, click channel by sid, wait for .m3u8.
+    pub async fn fetch_mgtv(
+        &self,
+        page_url: &str,
+        sid: &str,
+        user_agent: &str,
+        fetch_timeout: Duration,
+    ) -> Option<String> {
+        let tab = self.new_tab().await.ok()?;
+        let ws_url = tab.ws_url.clone()?;
+
+        let result = timeout(
+            fetch_timeout,
+            drive_mgtv(&ws_url, page_url, sid, user_agent),
+        )
+        .await;
+
+        self.close_tab(&tab.id).await;
+
+        match result {
+            Ok(Ok(u)) => u,
+            _ => None,
         }
     }
 }
 
-impl Drop for BrowserHandle {
-    fn drop(&mut self) {
-        let _ = self.process.start_kill();
-    }
-}
+// ─── CDP helpers ──────────────────────────────────────────────────────────────
 
-/// Read the DevTools port from the child's stderr stream.
-async fn read_devtools_port(
-    stderr: tokio::process::ChildStderr,
-) -> Result<u16> {
+async fn read_devtools_port(stderr: tokio::process::ChildStderr) -> Result<u16> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut reader = BufReader::new(stderr).lines();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
 
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout_at(deadline, reader.next_line()).await {
-            Ok(Ok(Some(line))) => {
-                // e.g. "DevTools listening on ws://127.0.0.1:34521/..."
-                if line.contains("DevTools listening on ws://") {
-                    if let Some(port_str) = line.split(':').nth(3) {
-                        let port: u16 = port_str
-                            .split('/')
-                            .next()
-                            .unwrap_or("")
-                            .parse()
-                            .context("Invalid DevTools port")?;
-                        return Ok(port);
-                    }
+            Ok(Ok(Some(line))) if line.contains("DevTools listening on ws://") => {
+                if let Some(port_str) = line.split(':').nth(3) {
+                    let port: u16 = port_str
+                        .split('/')
+                        .next()
+                        .unwrap_or("")
+                        .parse()
+                        .context("Invalid DevTools port")?;
+                    return Ok(port);
                 }
             }
-            _ => break,
+            _ => {}
         }
     }
     Err(anyhow!("Timed out waiting for Chrome DevTools port"))
 }
 
-/// Drive a single tab via CDP WebSocket: navigate and intercept network requests.
-async fn drive_tab(
+type WsSink = futures::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    Message,
+>;
+type WsStream = futures::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+>;
+
+async fn cdp_send(write: &mut WsSink, id: u64, method: &str, params: Value) -> Result<()> {
+    let cmd = serde_json::json!({ "id": id, "method": method, "params": params });
+    write.send(Message::Text(cmd.to_string())).await?;
+    Ok(())
+}
+
+/// Wait for the next Network.requestWillBeSent event matching predicate.
+async fn wait_for_request<F>(read: &mut WsStream, timeout_ms: u64, pred: F) -> Option<String>
+where
+    F: Fn(&str) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), read.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(val) = serde_json::from_str::<Value>(&text) {
+                    if val["method"] == "Network.requestWillBeSent" {
+                        let url = val["params"]["request"]["url"].as_str().unwrap_or("");
+                        if pred(url) {
+                            return Some(url.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+async fn setup_page(write: &mut WsSink, user_agent: &str, blocked: &[&str]) -> Result<()> {
+    let mut id = 1u64;
+    cdp_send(write, id, "Network.enable", serde_json::json!({})).await?;
+    id += 1;
+    cdp_send(write, id, "Network.setUserAgentOverride", serde_json::json!({ "userAgent": user_agent })).await?;
+    id += 1;
+    cdp_send(write, id, "Network.setBlockedURLs", serde_json::json!({ "urls": blocked })).await?;
+    Ok(())
+}
+
+// ─── Default fetcher ──────────────────────────────────────────────────────────
+
+async fn drive_default(
     ws_url: &str,
     page_url: &str,
     m3u8_match: &str,
@@ -161,74 +223,108 @@ async fn drive_tab(
     let (ws, _) = connect_async(ws_url).await?;
     let (mut write, mut read) = ws.split();
 
-    let mut id_counter: u64 = 1;
-    let mut found_url: Option<String> = None;
+    setup_page(&mut write, user_agent, &[
+        "*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp",
+        "*.woff", "*.woff2", "*.ttf", "*.mp4", "*.mp3",
+    ]).await?;
 
-    // Helper to send CDP commands
-    macro_rules! cdp {
-        ($method:expr, $params:tt) => {{
-            let cmd = serde_json::json!({
-                "id": id_counter,
-                "method": $method,
-                "params": $params
-            });
-            id_counter += 1;
-            use futures::SinkExt;
-            write
-                .send(Message::Text(cmd.to_string()))
-                .await
-                .ok();
-        }};
-    }
-
-    // Enable Network domain
-    cdp!("Network.enable", {});
-    // Set UA
-    cdp!("Network.setUserAgentOverride", { "userAgent": user_agent });
-    // Block images/fonts/media to speed things up
-    cdp!("Network.setBlockedURLs", {
-        "urls": ["*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp", "*.woff", "*.woff2", "*.ttf", "*.mp4", "*.mp3"]
-    });
-    // Navigate
-    cdp!("Page.navigate", { "url": page_url });
-    // Trigger autoplay
-    sleep(Duration::from_millis(500)).await;
-    cdp!("Runtime.evaluate", {
+    let mut id = 10u64;
+    cdp_send(&mut write, id, "Page.navigate", serde_json::json!({ "url": page_url })).await?;
+    id += 1;
+    sleep(Duration::from_millis(800)).await;
+    cdp_send(&mut write, id, "Runtime.evaluate", serde_json::json!({
         "expression": "document.querySelectorAll('video').forEach(v => v.play().catch(()=>{}))"
-    });
+    })).await?;
 
-    // Listen for network request events
     let match_str = m3u8_match.to_string();
-    for _ in 0..200 {
-        // up to ~40s in 200ms steps
-        match tokio::time::timeout(Duration::from_millis(200), read.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                    let method = val["method"].as_str().unwrap_or("");
-                    if method == "Network.requestWillBeSent" {
-                        let url = val["params"]["request"]["url"]
-                            .as_str()
-                            .unwrap_or("");
-                        if url.contains(&match_str)
-                            && !url.contains("ts")
-                            && !url.contains("log.")
-                            && !url.contains("beacon")
-                            && !url.contains("collect")
-                        {
-                            found_url = Some(url.to_string());
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let found = wait_for_request(&mut read, 25_000, |url| {
+        url.contains(&match_str)
+            && !url.contains(".ts")
+            && !url.contains("log.")
+            && !url.contains("beacon")
+            && !url.contains("collect")
+    }).await;
 
-    Ok(found_url)
+    Ok(found)
 }
 
-/// A long-lived browser pool that keeps one Chrome instance alive.
+// ─── MGTV fetcher ─────────────────────────────────────────────────────────────
+
+async fn drive_mgtv(
+    ws_url: &str,
+    page_url: &str,
+    sid: &str,
+    user_agent: &str,
+) -> Result<Option<String>> {
+    let (ws, _) = connect_async(ws_url).await?;
+    let (mut write, mut read) = ws.split();
+
+    setup_page(&mut write, user_agent, &[
+        "*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp",
+        "*.woff", "*.woff2", "*.ttf",
+    ]).await?;
+
+    let mut id = 10u64;
+    cdp_send(&mut write, id, "Page.navigate", serde_json::json!({ "url": page_url })).await?;
+    id += 1;
+
+    // Wait for networkidle2-like state (up to 12s)
+    sleep(Duration::from_millis(5000)).await;
+
+    // Close modals
+    let close_script = r#"
+        ['.m-close', '.modal-close', '.ext-close', '.close-btn', '.dialog-close']
+            .forEach(s => document.querySelector(s)?.click());
+    "#;
+    cdp_send(&mut write, id, "Runtime.evaluate", serde_json::json!({ "expression": close_script })).await?;
+    id += 1;
+
+    // Reset any playing video
+    cdp_send(&mut write, id, "Runtime.evaluate", serde_json::json!({
+        "expression": "document.querySelectorAll('video').forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); })"
+    })).await?;
+    id += 1;
+
+    // Click the channel by sid
+    let click_script = format!(
+        r#"
+        (function() {{
+            const selector = 'a[data-channel-sid="{}"]';
+            const el = document.querySelector(selector);
+            if (!el) return false;
+            el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+            el.click();
+            return true;
+        }})()
+        "#,
+        sid
+    );
+    cdp_send(&mut write, id, "Runtime.evaluate", serde_json::json!({
+        "expression": click_script,
+        "returnByValue": true
+    })).await?;
+    id += 1;
+
+    // Wait a moment then trigger video play
+    sleep(Duration::from_millis(500)).await;
+    cdp_send(&mut write, id, "Runtime.evaluate", serde_json::json!({
+        "expression": "document.querySelectorAll('video').forEach(v => v.play().catch(()=>{}))"
+    })).await?;
+
+    // Now wait for the .m3u8 request
+    let found = wait_for_request(&mut read, 12_000, |url| {
+        url.contains(".m3u8")
+            && !url.contains(".ts")
+            && !url.contains("log.")
+            && !url.contains("beacon")
+            && !url.contains("collect")
+    }).await;
+
+    Ok(found)
+}
+
+// ─── BrowserPool ─────────────────────────────────────────────────────────────
+
 pub struct BrowserPool {
     handle: Mutex<Option<BrowserHandle>>,
     chrome_path: String,
@@ -242,44 +338,63 @@ impl BrowserPool {
         })
     }
 
-    /// Fetch a stream URL, starting the browser if needed.
+    async fn ensure_browser(&self) -> bool {
+        let mut guard = self.handle.lock().await;
+        if guard.is_none() {
+            match BrowserHandle::spawn(&self.chrome_path).await {
+                Ok(h) => {
+                    info!("Chrome started");
+                    *guard = Some(h);
+                    true
+                }
+                Err(e) => {
+                    warn!("Failed to start Chrome: {}", e);
+                    false
+                }
+            }
+        } else {
+            true
+        }
+    }
+
+    /// Fetch stream URL using the appropriate strategy for the channel.
+    ///
+    /// - `mgtv_sid`: Some(sid) → MGTV strategy
+    /// - otherwise → default strategy
     pub async fn fetch(
         &self,
         page_url: &str,
         m3u8_match: &str,
         user_agent: &str,
         fetch_timeout_ms: u64,
+        mgtv_sid: Option<&str>,
     ) -> Option<String> {
-        let mut guard = self.handle.lock().await;
-
-        // Lazily start Chrome
-        if guard.is_none() {
-            match BrowserHandle::spawn(&self.chrome_path).await {
-                Ok(h) => {
-                    info!("Chrome started");
-                    *guard = Some(h);
-                }
-                Err(e) => {
-                    warn!("Failed to start Chrome: {}", e);
-                    return None;
-                }
-            }
+        if !self.ensure_browser().await {
+            return None;
         }
 
-        let handle = guard.as_ref().unwrap();
+        let guard = self.handle.lock().await;
+        let handle = guard.as_ref()?;
         let timeout_dur = Duration::from_millis(fetch_timeout_ms);
 
-        match handle
-            .fetch_stream_url(page_url, m3u8_match, user_agent, timeout_dur)
-            .await
-        {
-            Ok(url) => url,
-            Err(e) => {
-                warn!("Browser fetch error: {}", e);
-                // Kill stale browser; will restart on next call
-                *guard = None;
-                None
+        let result = if let Some(sid) = mgtv_sid {
+            handle.fetch_mgtv(page_url, sid, user_agent, timeout_dur).await
+        } else {
+            handle.fetch_default(page_url, m3u8_match, user_agent, timeout_dur).await
+        };
+
+        // Drop guard before potentially restarting
+        drop(guard);
+
+        if result.is_none() {
+            // Potentially stale browser — restart on next call
+            let mut guard = self.handle.lock().await;
+            if guard.is_some() {
+                warn!("Browser fetch returned nothing; will restart on next call");
+                // Don't kill it yet — might just be a channel with no stream
             }
         }
+
+        result
     }
 }
